@@ -1,0 +1,613 @@
+---
+title: "Chapter 2: cover change models"
+author: "Alberto Rovellini"
+date: "27 March 2019"
+output:
+  html_document:
+    code_folding: hide
+    toc: yes
+    toc_float: yes
+  pdf_document:
+    toc: yes
+---
+
+Third script of the community analysis for Hoga Island. Same modelling approach as from section 2 of script 2, but instead of testing the effects of free space on cover we do so on change in percent cover. Rationale is that cover might change a lot if there is a lot of free space coming available.
+
+We are using the logarithm of the change here. Reason being, the ratio itself is a really bad, bad idea. Log-transforming it basically sets no change to 0, and positive or negative change of the same magnitude on either side of zero. This sounds reasonable.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message = FALSE, warning = FALSE}
+
+library(data.table)
+library(ggplot2)
+library(abind)
+library(dplyr)
+library(reshape2)
+library(lme4)
+library(nlme)
+library(effects)
+library(emmeans)
+
+```
+
+```{r fig.height = 12, fig.width = 15}
+
+all.frames <- read.csv("//Staff/Home/SCIFAC/rovellal/DocumentsRedir/Projects/Chapter 2/Statistics/trunk_FS_as_FS/quadratsData_CCA.csv", sep = ",")
+
+all.frames <- all.frames %>% mutate(
+  Group = factor(rep(c("SAND/RUBBLE", "ALGAE", "CCA", "FREE SPACE", "CORAL", "OTHER", "SPONGE", "UNKNOWN"), nrow(all.frames)/8), levels = c("CORAL", "ALGAE", "CCA", "SPONGE", "OTHER", "UNKNOWN", "FREE SPACE", "SAND/RUBBLE"))
+)
+
+all.frames$FG <- factor(all.frames$FG, levels = c("HC", "AL", "CA", "SP", "OT", "UN", "FS", "AB"))
+
+names(all.frames) <- c("Group_code", "Cover", "Year", "Site", "Quadrat", "Group_name")
+
+glimpse(all.frames)
+
+# fill gap years (2009-2013) for time series plotting
+
+dummy.frame <- all.frames[all.frames$Year == 2006,]
+dummy.frame$Cover <- rep(NA, dim(dummy.frame)[1])
+
+missing.years <- 2009:2013
+
+dummy.list <- vector(mode = "list", length = length(missing.years))
+
+for(i in 1:length(missing.years)) {
+  dummy.list[[i]] <- dummy.frame
+  dummy.list[[i]]$Year <- rep(missing.years[i], dim(dummy.frame)[1]) 
+}
+
+all.frames.ts <- rbind(all.frames[all.frames$Year %in% 2006:2008, ], rbindlist(dummy.list), all.frames[all.frames$Year %in% 2014:2017,]) 
+
+```
+
+```{r}
+
+# get rid of last all_frame column as it contains information that is no longer needed (it was for the plot only)
+
+all.frames <- all.frames[,-dim(all.frames)[2]]
+
+# first, we need to add an empty frame with NAs for 2015 S3 Q3.
+
+groups.levels <- levels(factor(all.frames$Group_code))
+
+dummy2015 <- data.frame(groups.levels, rep(NA, length(groups.levels)), rep(2015, length(groups.levels)),
+                        rep("S3", length(groups.levels)), rep("Q3", length(groups.levels)))
+names(dummy2015) <- names(all.frames)
+
+# now bind it to all_frames
+
+frames.growth <- rbind(all.frames, dummy2015)
+
+frames.growth <- frames.growth[with(frames.growth, order(Year, Site, Quadrat)),]
+
+# add useful columns: cover at t1, t1, the gap etc
+
+lvec <- length(groups.levels)*3*5
+
+frames.growth$Cover.t1 <- c(frames.growth$Cover[-c(1:lvec)], rep(NA, lvec))
+
+frames.growth$Cover.t1[c(((lvec*2)+1):(lvec*3))] <- NA # gets rid of 2014 in 2008
+ 
+frames.growth$Year.t1 <- rep(c(2007, 2008, NA, 2015, 2016, 2017, NA), each = lvec) # add column for t+1
+
+for (i in 1:nrow(frames.growth)) {
+  frames.growth$Gap[i] <- paste(substr(frames.growth$Year[i], 3, 4), 
+                                substr(frames.growth$Year.t1[i], 3, 4), sep = "-")
+}
+
+# introduce three more columns here: free space last year, CCA last year, CCA + free space last year (i.e. FS from other analysis)
+
+fs.cover.t0 <- frames.growth[frames.growth$Group_code == "FS",]$Cover
+
+fs.template <- vector(mode = "double", length = length(fs.cover.t0) * nrow(frames.growth)/length(fs.cover.t0))
+
+for (i in 1:length(fs.template)) {
+  fs.template[i] <- fs.cover.t0[ceiling(i/(nrow(frames.growth)/length(fs.cover.t0)))]
+ }
+
+frames.growth$FS_t0 <- fs.template
+
+frames.growth$QuadratSite <- paste(frames.growth$Quadrat, frames.growth$Site, sep = "")
+
+# added on 28/11. We need to replace Cover.t1 of S3Q3 2015 with NA for the sake of model fitting later on, or else it will fit the model with intercept or site only to that data point too, and the final object will be long 74 instead of 73 like all the others. That is a problem for model selection. Still have to double-check this, and also we may be able to just eliminate the bit above instead
+
+for (i in 1:nrow(frames.growth)) {
+  if(frames.growth$Year[i] == 2015 & frames.growth$QuadratSite[i] == "Q3S3") {
+    frames.growth$Cover.t1[i] <- NA
+  }
+}
+
+# need to set year = 0 for 2006, i.e. treat time as continuous again
+
+frames.growth$Year <- frames.growth$Year - 2006
+
+# calculate the change in % cover. 
+
+frames.growth <- frames.growth %>% mutate(
+  relChange = (Cover.t1 - Cover) / Cover, # relative change
+  change    = Cover.t1 / Cover,
+  logchange = log10(change)
+)
+
+```
+
+Plot variation
+
+```{r, fig.width = 11}
+
+change.mean.site <- frames.growth %>% dplyr::group_by(
+  Group_code, Year, Site
+) %>% dplyr::summarise(
+  Mean = mean(logchange, na.rm = T),
+  SE = sd(logchange, na.rm = T)/sqrt(length(!is.na(logchange)))
+) %>% dplyr::ungroup(
+  
+) %>% dplyr::mutate(
+  Year = Year + 2006
+)
+
+ggplot(data = change.mean.site, aes(x = Year, y = Mean, group = Group_code))+
+  geom_point(aes(color = Group_code, shape = Group_code),position = position_dodge(width = .2), size = 2)+
+  geom_line(aes(color = Group_code), size = 0.5)+
+  geom_errorbar(aes(x = Year, ymin = Mean-SE, ymax = Mean+SE, color = Group_code), 
+                position = position_dodge(width = .2))+
+  # scale_colour_manual(values = c("#d11141", "#00aedb", "#00b159", "#f37735", "#ffc425", "purple", "grey", "black"))+
+  scale_color_grey(start = 0, end = 0.8)+
+  scale_shape_manual(values = 0:8)+
+  scale_x_continuous(breaks = 2005:2018)+
+  # scale_y_continuous(breaks = seq(0, 70, 10))+
+  theme_bw()+
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank())+
+  theme(plot.title = element_text(size=14, vjust=2))+
+  theme(axis.title.x = element_text(size=11,vjust=-0.5),
+        axis.title.y = element_text(size=11,vjust=0.5))+
+  theme(axis.text.x=element_text(size=11, angle = 45, 
+                                 hjust = 1, vjust = .9))+
+  theme(axis.text.y=element_text(size=11))+
+  facet_wrap(~ Site)+
+  theme(strip.text.x = element_blank(), strip.background = element_blank())
+
+```
+
+Get mean changes per group.
+
+```{r}
+
+change.means <- frames.growth %>% dplyr::group_by(
+  Group_code, Year
+) %>% dplyr::summarise(
+  Mean = mean(change, na.rm = T),
+  Stderr = sd(change, na.rm = T)/sqrt(length(!is.na(change))),
+  Max = max(change, na.rm = T),
+  Min = min(change, na.rm = T)
+) %>% dplyr::mutate(
+  Year = Year + 2006
+)
+
+change.sponge <- change.means[change.means$Group_code == "SP",]
+
+change.sponge
+
+```
+
+
+Plot
+
+```{r}
+
+for (i in 1:length(levels(frames.growth$Group_code))) {
+  
+  p <- ggplot(data = frames.growth[frames.growth$Group_code == levels(frames.growth$Group_code)[i],], 
+              aes(x = Cover, y = Cover.t1, group = Quadrat))+
+    geom_point(aes(shape = Quadrat), color = "grey20")+
+    geom_abline(slope = 1, intercept = 0, color = "grey", linetype = "dashed")+
+    theme_bw()+
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major = element_blank())+
+    theme(plot.title = element_text(size=14, vjust=2))+
+    theme(axis.title.x = element_text(size=10,vjust=-0.5),
+          axis.title.y = element_text(size=10,vjust=0.5))+
+    theme(axis.text.x=element_text(size=10))+
+    theme(axis.text.y=element_text(size=10))+
+    facet_grid(Group_code ~ Site)+
+    theme(strip.text.x = element_blank(), strip.background = element_blank())
+  
+  ggsave(paste("//Staff/Home/SCIFAC/rovellal/DocumentsRedir/Projects/Chapter 2/Statistics/trunk_FS_as_FS/pics/growth_", levels(frames.growth$Group_code)[i], ".pdf", sep = ""), p, width = 7.5, height = 2)
+  
+}
+
+```
+
+Interannual variability changes between groups. Corals and CCA are rather stable on average, algae and sponges are more variable. Do sponges and algae take up space more quickly than other groups maybe?
+
+Distribution of change variables.
+
+```{r}
+
+changes <- frames.growth %>% dplyr::select(
+  relChange:logchange
+) %>% melt()
+
+ggplot()+
+  geom_density(data = changes, aes(x = value))+
+  facet_wrap(~ variable, scales = "free")
+
+```
+
+Log transformation of the change is normally distributed.
+
+Plot interannual relative change (as absolute value, to express variability). 
+
+```{r, fig.width = 3.75, fig.height = 3}
+
+p <- ggplot(data = frames.growth[!frames.growth$Group_code %in% c("UN", "FS", "AB"),], aes(x = Group_code, y = logchange))+
+  stat_boxplot(geom = "errorbar", aes(colour = Site, fill = Site), outlier.shape = 1, alpha = 0.5, width = 0.6, lwd = 0.3, position = position_dodge(0.8))+
+  geom_boxplot(aes(colour = Site, fill = Site), outlier.shape = 1, alpha = 0.5, width = 0.6, lwd = 0.3, position = position_dodge(0.8))+
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey20")+
+  scale_x_discrete(labels=c("Hard corals", "Algae", "CCA", "Sponges", "Other"))+
+  scale_color_manual(values = c("grey50", "darkblue", "coral"))+
+  scale_fill_manual(values = c("grey50", "darkblue", "coral"))+
+  # scale_y_continuous(breaks = seq(0, 3.5, 0.5), name = expression(Change~(cover[t1]/cover[t0])))+
+  theme_bw()+
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank())+
+  theme(plot.title = element_text(size=14, vjust=2))+
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_text(size=10,vjust = 0.5))+
+  theme(axis.text.x = element_text(size=10, angle = 45, hjust = 1))+
+  theme(axis.text.y = element_text(size=10))#+
+  # facet_grid( ~ Site)+
+  # theme(strip.text.x = element_blank(), strip.background = element_blank())
+
+p
+
+# ggsave("//Staff/Home/SCIFAC/rovellal/DocumentsRedir/Projects/Chapter 2/Statistics/trunk_FS_as_FS/pics/interannualLog.pdf", p, width = 3.75, height = 3)
+
+```
+
+How do we formally determine if the interannual variability really is different between groups? We cannot use change, as an ANOVA will tets for differences between the means of the groups and not for variation around such means. May use an other measure of change, such as an absolute value of log-change. Unlikely to be normally distributed (it would be but we take the absolute value), use Kruskal-Wallis and then Dunn's test. However, KW should be used if the distributions have the same shape and equal variances. Only then one can talk about comparing the medians and such. If that is not the case, e.g. in the case of heteroscedasticity, one can still conclude that things are different, and that "values of group X are higher than values of group Y", or along these lines. See question at: https://www.researchgate.net/post/Assumptions_for_Kruskal-Wallis_and_Mann-Whitney-U_violated_are_there_alternatives
+
+```{r}
+
+library(dunn.test)
+library(multcomp)
+
+anova.frame <- frames.growth[complete.cases(frames.growth),]
+anova.frame <- anova.frame[is.finite(anova.frame$logchange),]
+
+anova.change <- dunn.test(x = abs(anova.frame$logchange), g = anova.frame$Group_code, kw = T, method = "sidak") # use absolute value, not normal distribution but that is the points of KW
+
+###################################
+
+# this is done with gls and variance structure that accounts for heteroskedasticity. We rely on the fact that linear models are robust to non-normal distribution, or else we need to use a gamma model again
+
+mod.int <- nlme::gls(abs(logchange) ~ Group_code,
+                 data = anova.frame,
+                 na.action = "na.omit",
+                 weights = varIdent(form = ~ 1 | Group_code))
+
+anova(mod.int)
+
+par(mfrow = c(1, 3))
+plot(resid(mod.int, type = "normalized")) # residuals are NOT normally distributed!!!
+hist(residuals(mod.int, type = "normalized"))
+qqnorm(residuals(mod.int, type = "normalized"))
+qqline(residuals(mod.int, type = "normalized")) 
+
+emmeans(mod.int, pairwise ~ Group_code, adjust = "bonferroni")
+
+# this is even less strict that the KW + Dunn, essentially it says the same thing: more variability
+
+```
+
+Errors are not normally distributed, but the model deals with different variances between the groups. Using a GLM has the disadvantage that we cannot fit a variance structure to the model. Perhaps do stick with KW after all, and discuss the alternative if asked. Discuss the similar results between the two, and the fact that we do not need coefficients at all as these are not predictive models.
+
+# Effect of free space on group changes. Using the logarithm of the change here as continuous variable.
+
+## Corals
+
+```{r, fig.width = 12, fig.height = 5}
+
+# first use ML to pick the relevant fixed effects
+
+coral.change.null <- nlme::lme(logchange ~ 1,
+                        random = ~ 1 | QuadratSite, 
+                        data = frames.growth[frames.growth$Group_code == "HC",],
+                        na.action = "na.omit",
+                        method = "ML",
+                        correlation = corCAR1(value = 0.2, form = ~ Year | QuadratSite))
+
+coral.change.fs <- update(coral.change.null, . ~ . + FS_t0)
+coral.change.site <- update(coral.change.null, . ~ . + Site)
+coral.change.add <- update(coral.change.fs, . ~ . + Site)
+coral.change.all <- update(coral.change.add, . ~ . + FS_t0 * Site)
+
+# backwards selection
+
+anova(coral.change.all, coral.change.add) # no interaction p = 0.7439
+anova(coral.change.add, coral.change.fs) # no site effect p = 0.3697
+anova(coral.change.add, coral.change.site) # no free space effect p = 0.7875
+
+```
+
+No effect of free space on change in coral cover (not surprising).
+
+## Sponges
+
+```{r, fig.width = 12, fig.height = 5}
+
+# first use ML to pick the relevant fixed effects
+
+sponge.change.null <- nlme::lme(logchange ~ 1,
+                         random = ~ 1 | QuadratSite, 
+                         data = frames.growth[frames.growth$Group_code == "SP",],
+                         na.action = "na.omit",
+                         method = "ML",
+                         correlation = corCAR1(value = 0.2, form = ~ Year | QuadratSite))
+
+sponge.change.fs <- update(sponge.change.null, . ~ . + FS_t0)
+sponge.change.site <- update(sponge.change.null, . ~ . + Site)
+sponge.change.add <- update(sponge.change.fs, . ~ . + Site)
+sponge.change.all <- update(sponge.change.add, . ~ . + FS_t0 * Site)
+
+# backwards selection
+
+anova(sponge.change.all, sponge.change.add) # interaction not significant, p = 0.7567
+anova(sponge.change.add, sponge.change.fs) # site does not matter, p = 0.6547
+anova(sponge.change.add, sponge.change.site) # free space does not matter, p = 0.6649
+
+```
+
+No effect of FS on changes in sponge cover. 
+
+## Algae
+
+```{r, fig.width = 12, fig.height = 5}
+
+# first use ML to pick the relevant fixed effects
+
+algae.change.null <- nlme::lme(logchange ~ 1,
+                        random = ~ 1 | QuadratSite, 
+                        data = frames.growth[frames.growth$Group_code == "AL",],
+                        na.action = "na.omit",
+                        method = "ML")
+
+algae.change.fs <- update(algae.change.null, . ~ . + FS_t0)
+algae.change.site <- update(algae.change.null, . ~ . + Site)
+algae.change.add <- update(algae.change.fs, . ~ . + Site)
+algae.change.all <- update(algae.change.add, . ~ . + FS_t0 * Site)
+
+# backwards selection
+
+anova(algae.change.all, algae.change.add) # interaction not significant, p = 0.4264
+anova(algae.change.add, algae.change.fs) # site does not matter, p = 0.0991
+anova(algae.change.add, algae.change.site) # free space matters, p = 0.0461
+
+# fit variance structure
+
+algae.change.fs.var <- update(algae.change.fs, weights = varIdent(form = ~ 1 | QuadratSite))
+
+# decide whether keep or drop variance structure
+
+anova(algae.change.fs.var, algae.change.fs) # variance structure does not matter
+
+# refit with REML
+
+algae.change.model <- update(algae.change.fs, method = "REML")
+
+summary(algae.change.model) 
+
+# Phi = 2.047977e-10 why so low? Look into this
+
+par(mfrow = c(1, 3))
+plot(resid(algae.change.model, type = "response")) # rather "fat" distribution
+hist(residuals(algae.change.model, type = "response"))
+qqnorm(residuals(algae.change.model, type = "response"))
+qqline(residuals(algae.change.model, type = "response")) 
+
+# emmeans
+
+emmeans(algae.change.model, "FS_t0", type = "response", data = frames.growth[frames.growth$Group_code == "AL",])
+
+```
+
+LTR test encourages to keep the model with free space (p = 0.0461). However, the relationship between free space and the change in algal cover is basically non-existent, and statistically not different from zero (0.0896) according to the model fit.Therefore, no real effect of free space on changes in algal cover. 
+
+## CCA
+
+```{r, fig.width = 12, fig.height = 5}
+
+# first use ML to pick the relevant fixed effects
+
+coralal.change.null <- nlme::lme(logchange ~ 1,
+                        random = ~ 1 | QuadratSite, 
+                        data = frames.growth[frames.growth$Group_code == "CA",],
+                        na.action = "na.omit",
+                        method = "ML",
+                        correlation = corCAR1(value = 0.2, form = ~ Year | QuadratSite))
+
+coralal.change.fs <- update(coralal.change.null, . ~ . + FS_t0)
+coralal.change.site <- update(coralal.change.null, . ~ . + Site)
+coralal.change.add <- update(coralal.change.fs, . ~ . + Site)
+coralal.change.all <- update(coralal.change.add, . ~ . + FS_t0 * Site)
+
+# backwards selection
+
+anova(coralal.change.all, coralal.change.add) # interaction not significant, p = 0.1927
+anova(coralal.change.add, coralal.change.fs) # site does not matter, p = 0.9618
+anova(coralal.change.add, coralal.change.site) # free space matters, p = 0.1634
+
+```
+
+No effect of FS on changes in CA. 
+
+## Other
+
+```{r, fig.width = 12, fig.height = 5}
+
+# first use ML to pick the relevant fixed effects
+
+other.change.null <- nlme::lme(logchange ~ 1,
+                        random = ~ 1 | QuadratSite, 
+                        data = frames.growth[frames.growth$Group_code == "OT",],
+                        na.action = "na.omit",
+                        method = "ML",
+                        correlation = corCAR1(value = 0.2, form = ~ Year | QuadratSite))
+
+other.change.fs <- update(other.change.null, . ~ . + FS_t0)
+other.change.site <- update(other.change.null, . ~ . + Site)
+other.change.add <- update(other.change.fs, . ~ . + Site)
+other.change.all <- update(other.change.add, . ~ . + FS_t0 * Site)
+
+# backwards selection
+
+anova(other.change.all, other.change.add) # interaction does not matter, p = 0.4482
+anova(other.change.add, other.change.fs) # site matters, p = 0.2642
+anova(other.change.add, other.change.site) # free space alone does not matter, p = 0.8056
+
+```
+
+No lagged effect of free space on change in cover of other benthic organisms. 
+
+###Effect plots for FS on change in algae
+
+```{r, fig.width = 5, fig.height = 3.8}
+
+# create a dummy frame with time included in the effect format, only for plotting purpose.
+
+ef.algae <- data.frame(Effect("FS_t0", algae.change.model,  xlevel = 10))
+
+p <- ggplot()+
+ geom_line(data = ef.algae, aes(x = FS_t0, y = fit))+
+  geom_line(data = ef.algae, aes(x = FS_t0, y = lower), linetype = "dashed", color = "darkgrey")+
+  geom_line(data = ef.algae, aes(x = FS_t0, y = upper), linetype = "dashed", color = "darkgrey")+
+  #geom_hline(yintercept = 1, linetype = "dashed", color = "red")+
+  geom_point(data = frames.growth[frames.growth$Group_code == "AL",], aes(x = FS_t0, y = logchange, shape = Site), color = "grey20", size = 1.5)+
+  scale_x_continuous(name = expression(Free~space~cover[t-1]),
+                     breaks = seq(0, 15, 2.5))+
+  # scale_y_continuous(name = expression(Algal~cover[t]/algal~cover[t-1]), 
+  #                    breaks = seq(0, 3, 0.5), limits = c(0, 3.2))+
+  scale_shape_manual(values = c(0, 1, 2))+
+  scale_color_brewer(palette = "Set1")+
+  theme_bw()+
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank())
+
+p
+
+# ggsave("//Staff/Home/SCIFAC/rovellal/DocumentsRedir/Projects/Chapter 2/Statistics/trunk_FS_as_FS/pics/AL_change_FS_model_onepanel.pdf", p, width = 4, height = 3, useDingbats = T)
+
+  
+```
+
+# Do changes in sponge abundance depend on free space?
+
+```{r fig.height = 5, fig.width = 8}
+
+# introduce sponge counts data and test for correlation with sponge cover
+
+sponge.counts <- read.csv(file = "//Staff/Home/SCIFAC/rovellal/DocumentsRedir/Projects/Chapter 2/Statistics/trunk_FS_as_FS/buoy3_model_data_2017.csv", 
+                          stringsAsFactors = FALSE, header = TRUE)
+
+sponge.counts$Year <- sponge.counts$Year+2000
+
+# subset to matching years only
+
+my.years <- levels(factor(all.frames$Year))
+
+sponge.counts.match <- sponge.counts[sponge.counts$Year %in% my.years,]
+
+# subset %cover dataset to sponges only
+
+sponge.cover.match <- all.frames[all.frames$Group_code == "SP",]
+
+# add one line with 2015 S3 Q3
+
+dummy15 <- data.frame(Group_code = "SP", Cover = NA, Year = 2015, Site = "S3", Quadrat = "Q3")
+
+sponge.cover.match <- rbind(sponge.cover.match, dummy15)
+
+sponge.cover.match <- sponge.cover.match[with(sponge.cover.match, order(Year, Site, Quadrat)),]
+
+# write new dataframe with cover and counts
+
+sponges <- cbind(sponge.cover.match, sponge.counts.match$Total)
+
+names(sponges) <- c(names(sponges)[-length(names(sponges))], "Counts")
+
+sponges$QuadratSite <- paste(sponges$Quadrat, sponges$Site, sep = "")
+
+# add free space to this
+
+fs.cover.match <- rbind(all.frames[all.frames$Group_code == "FS",], dummy15)
+
+fs.cover.match <- fs.cover.match[with(fs.cover.match, order(Year, Site, Quadrat)),] 
+
+sponges$FS_t0 <- fs.cover.match$Cover
+
+# work out sponge counts at t1
+
+sponges$Counts.t1 <- c(sponges$Counts[-(1:15)], rep(NA, 15))
+
+# replace the entries in here with NA if the Year is: 2008
+
+for (i in 1:nrow(sponges)) {
+  if(sponges$Year[i] == 2008) {
+    sponges$Counts.t1[i] <- NA
+  }
+}
+
+# calculate growth
+
+sponges <- sponges %>% dplyr::mutate(
+  relChange = (Counts.t1 - Counts) / Counts, # relative changes, let's avoid percentages. However this can assume negative values
+  change     = Counts.t1 / Counts, # this is a ratio between t1 and t0
+  logchange  = log(change)
+) %>% dplyr::select(
+  Year, Site, Quadrat, QuadratSite, FS_t0, relChange, change, logchange, Counts.t1
+)
+
+# must now get rid of the 2015 row, hehe
+
+sponges <- sponges[!(sponges$Year == 2015 & sponges$QuadratSite == "Q3S3"),]
+
+```
+
+```{r, fig.width = 12, fig.height = 5}
+
+# first use ML to pick the relevant fixed effects
+
+counts.change.null <- nlme::lme(Counts.t1 ~ 1,
+                        random = ~ 1 | QuadratSite, 
+                        data = sponges,
+                        na.action = "na.omit",
+                        method = "ML",
+                        correlation = corCAR1(value = 0.2, form = ~ Year | QuadratSite))
+
+counts.change.fs <- update(counts.change.null, . ~ . + FS_t0)
+counts.change.site <- update(counts.change.null, . ~ . + Site)
+counts.change.add <- update(counts.change.fs, . ~ . + Site)
+counts.change.all <- update(counts.change.add, . ~ . + FS_t0 * Site)
+
+# backwards selection
+
+anova(counts.change.all, counts.change.add) # interaction not significant, p = 0.6598
+anova(counts.change.add, counts.change.fs) # site does not matter, p = 0.6037
+anova(counts.change.add, counts.change.site) # free space does not matter, p = 0.7069
+
+```
+
+Free space does not have an effect on changes in sponge abundance between t0 and t1. That is, we found no evidence for free space as a driver of those fluctuations either, thus no evidence for density-dependent regulation in the assemblage.  
+
+# Summary
+
+No significant effect of percent cover of free space at t0 on the logchange of benthic groups.

@@ -1,0 +1,539 @@
+---
+title: 'Chapter 2: visualisation and community analysis (ordination)'
+author: "Alberto Rovellini"
+date: "8 March 2019"
+output:
+  html_document:
+    code_folding: hide
+    toc: yes
+    toc_float: yes
+  pdf_document:
+    toc: yes
+---
+
+This document walks through the firt part of the statistical analysis of the benthic commnity at Buoy 3, Hoga, Indonesia. Biological benthic groups are hard corals, CCA, sponges, algae, and other (including ascidians and soft corals). Free space is made of rock, dead coral and rubble. Sand and silt are considered separate. This documents does:
+
+1. Visualise temporal dynamics of the benthic groups averaged within each site. 
+2. Visualise ternary relationships between hard corals, algae and sponges, as most common and most abundant competitors of the benthos.
+3. Visualise spatial and temporal patterns of the community composition with non-metric MDS, and quantify the effect of time, space and a combination of the two with permutational MANOVA.
+
+```{r, echo = FALSE, include=FALSE, warning = FALSE}
+knitr::opts_chunk$set(echo = TRUE, width = 150)
+```
+
+```{r, message = FALSE, warning = FALSE}
+
+library(readxl)
+library(data.table)
+library(ggplot2)
+library(abind)
+library(vegan)
+library(ggvegan)
+library(dplyr)
+library(reshape2)
+library(ggtern)
+
+```
+
+```{r fig.height = 12, fig.width = 15}
+
+all.frames <- read.csv("//Staff/Home/SCIFAC/rovellal/DocumentsRedir/Projects/Chapter 2/Statistics/trunk_FS_as_FS/quadratsData_CCA.csv", sep = ",")
+
+all.frames <- all.frames %>% mutate(
+  Group = factor(rep(c("SAND/SILT", "ALGAE", "CCA", "FREE SPACE", "CORAL", "OTHER", "SPONGE", "UNKNOWN"), nrow(all.frames)/8), 
+                 levels = c("CORAL", "ALGAE", "CCA", "SPONGE", "OTHER", "UNKNOWN", "FREE SPACE", "SAND/SILT"))
+)
+
+all.frames$FG <- factor(all.frames$FG, levels = c("HC", "AL", "CA", "SP", "OT", "UN", "FS", "AB"))
+
+names(all.frames) <- c("Group_code", "Cover", "Year", "Site", "Quadrat", "Group_name")
+
+glimpse(all.frames)
+
+# fill gap years (2009-2013) for time series plotting
+
+dummy.frame <- all.frames[all.frames$Year == 2006,]
+dummy.frame$Cover <- rep(NA, dim(dummy.frame)[1])
+
+missing.years <- 2009:2013
+
+dummy.list <- vector(mode = "list", length = length(missing.years))
+
+for(i in 1:length(missing.years)) {
+  dummy.list[[i]] <- dummy.frame
+  dummy.list[[i]]$Year <- rep(missing.years[i], dim(dummy.frame)[1]) 
+}
+
+all.frames.ts <- rbind(all.frames[all.frames$Year %in% 2006:2008, ], rbindlist(dummy.list), all.frames[all.frames$Year %in% 2014:2017, ])
+
+```
+
+# Percent cover of benthic types in time.
+
+Calculating mean percent covers of main benthic types at each site.
+
+```{r}
+
+mean.frames <- all.frames.ts %>% dplyr::group_by(
+  Group_code, Year, Site
+) %>% dplyr::summarise(
+  Mean = mean(Cover),
+  SE   = sd(Cover) / sqrt(length(Cover))
+)
+
+```
+
+Get ranges of % cover for each groups (mean values per site here).
+
+```{r}
+
+range.frames <- all.frames %>% dplyr::group_by(
+  Group_code, Site
+) %>% dplyr::summarize(
+  Max = max(Cover),
+  Min = min(Cover),
+  Mean = mean(Cover),
+  SE = sd(Cover) / sqrt(length(Cover))
+)
+
+range.frames
+
+```
+
+
+Plot of mean values of benthic cover per site. Differences between sites tested with mixed models later on.
+
+```{r fig.height = 3.5, fig.width = 9.5}
+
+dynMeans <- ggplot(data = mean.frames, aes(x = Year, y = Mean, 
+                                           group = Group_code))+
+  geom_point(aes(color = Group_code, shape = Group_code),position = position_dodge(width = .2), size = 2)+
+  geom_line(aes(color = Group_code), size = 0.5)+
+  geom_errorbar(aes(x = Year, ymin = Mean-SE, ymax = Mean+SE, color = Group_code), 
+                position = position_dodge(width = .2))+
+  # scale_colour_manual(values = c("#d11141", "#00aedb", "#00b159", "#f37735", "#ffc425", "purple", "grey", "black"))+
+  scale_color_grey(start = 0, end = 0.8)+
+  scale_shape_manual(values = 0:8)+
+  scale_x_continuous(breaks = 2005:2018)+
+  scale_y_continuous(breaks = seq(0, 70, 10))+
+  theme_bw()+
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank())+
+  theme(plot.title = element_text(size=14, vjust=2))+
+  theme(axis.title.x = element_text(size=11,vjust=-0.5),
+        axis.title.y = element_text(size=11,vjust=0.5))+
+  theme(axis.text.x=element_text(size=11, angle = 45, 
+                                 hjust = 1, vjust = .9))+
+  theme(axis.text.y=element_text(size=11))+
+  facet_wrap(~ Site)+
+  theme(strip.text.x = element_blank(), strip.background = element_blank())
+
+dynMeans
+
+ggsave("//Staff/Home/SCIFAC/rovellal/DocumentsRedir/Projects/Chapter 2/Statistics/trunk_FS_as_FS/pics/meanDynamics_GREY.pdf", dynMeans,
+       width = 9, height = 4)
+
+```
+
+```{r fig.height = 8, fig.width = 9.5}
+
+# added for defense 25/11/2019
+
+dynMeans <- ggplot(data = mean.frames[mean.frames$Group_code %in% c("HC", "AL", "CA", "SP"),], aes(x = Year, y = Mean))+
+  geom_point()+
+  geom_line()+
+  geom_errorbar(aes(x = Year, ymin = Mean-SE, ymax = Mean+SE), 
+                position = position_dodge(width = .2))+
+  # scale_colour_manual(values = c("#d11141", "#00aedb", "#00b159", "#f37735", "#ffc425", "purple", "grey", "black"))+
+  scale_color_grey(start = 0, end = 0.8)+
+  scale_shape_manual(values = 0:8)+
+  scale_x_continuous(breaks = 2005:2018)+
+  scale_y_continuous(breaks = seq(0, 70, 10))+
+  theme_bw()+
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank())+
+  theme(plot.title = element_text(size=14, vjust=2))+
+  theme(axis.title.x = element_text(size=11,vjust=-0.5),
+        axis.title.y = element_text(size=11,vjust=0.5))+
+  theme(axis.text.x=element_text(size=11, angle = 45, 
+                                 hjust = 1, vjust = .9))+
+  theme(axis.text.y=element_text(size=11))+
+  facet_grid(Group_code ~ Site, scales = "free")+
+  theme(strip.text.x = element_blank(), strip.background = element_blank())
+
+dynMeans
+
+ggsave("//Staff/Home/SCIFAC/rovellal/DocumentsRedir/Projects/Defense/pics/separate_panels1.png", dynMeans,
+       width = 7, height = 8, unit = "in")
+
+```
+
+The plot above shows there are no obvious temporal trends of increase or decline of any particular benthic group in the community between 2006-2017. There are signs of inter-site differences in the percent corev of some benthic types. Intra-site variability is also rather large for the most abundant groups, especially for hard corals. This indicates that quadrats are different enough from each other all in all (encouraging for the independence of the samples). Hard corals are the dominant live benthic type at sites A and B, CCA at site C. CCA is the second most abundant category. The most abundant benthic groups following hard corals excluding free space are algae and sponges, and "other" only at one site at the beginning of the sampling period (made up by soft corals for the most part). 
+
+# Sites and reef means
+
+Potentially large variation between sites, not so much in time.
+
+```{r}
+
+# This is mean and SE taken from pooling data from all sites. Mean is equivalent to GM (except for 2015 but it is not a big deal), and SE is an estimate of the unceratinty (similar to deriving it from compound variance calculations etc.
+
+mean.reef <- all.frames %>% dplyr::group_by(
+  Group_code, Year
+) %>% dplyr::summarise(
+  Mean = mean(Cover),
+  SE   = sd(Cover) / sqrt(length(Cover))
+)
+
+```
+
+```{r}
+
+range.reef <- all.frames %>% dplyr::group_by(
+  Group_code
+) %>% dplyr::summarize(
+  Max = max(Cover),
+  Min = min(Cover),
+  Mean = mean(Cover),
+  SE = sd(Cover) / sqrt(length(Cover))
+)
+
+range.reef
+
+```
+
+Plot reef-level means
+
+```{r}
+
+ggplot(data = mean.reef, aes(x = Year, y = Mean, 
+                                           group = Group_code))+
+  geom_point(aes(color = Group_code), position = position_dodge(width = .2))+
+  geom_line(aes(color = Group_code))+
+  geom_errorbar(aes(x = Year, ymin = Mean-SE, ymax = Mean+SE, color = Group_code), 
+                position = position_dodge(width = .2))+
+  scale_x_continuous(breaks = 2005:2018)+
+  scale_colour_manual(values = c("#d11141", "#00aedb", "#00b159", "#f37735", "#ffc425", "purple", "grey", "black"))+
+  scale_x_continuous(breaks = 2005:2018)+
+  scale_y_continuous(breaks = seq(0, 70, 10))+
+  theme_bw()+
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank())+
+  theme(plot.title = element_text(size=14, vjust=2))+
+  theme(axis.title.x = element_text(size=10,vjust=-0.5),
+        axis.title.y = element_text(size=10,vjust=0.5))+
+  theme(axis.text.x=element_text(size=10, angle = 45, 
+                                 hjust = 1, vjust = .9))+
+  theme(axis.text.y=element_text(size=10))
+
+```
+
+
+CCA is abundant, but it is often found to be a weaker direct competitor compared to corals, macroalgae and sponges, thus it is usually not at the center of attention in the context of regime shifts. If we isolate the three most abundant benthic competitors, i.e. hard corals, sponges and algae, how do they interact? Do their relative proportions change in time? Are there alternative stages on the reef at any point? 
+
+```{r fig.height = 4.5, fig.width = 15.5}
+
+ternary <- dcast(all.frames, Year + Site + Quadrat ~ Group_code, value.var = "Cover")
+
+# Fix column names (for CSIRO talk's slides)
+
+names(ternary) <- c("Year", "Site", "Quadrat", "Coral", "Algae", "CCA", "Sponge", "Other", "Unknown", "FreeSpace",  "Abiotic")
+  
+ 
+lines <- data.frame(x = c(50, 0, 50), 
+                    y = c(50, 50, 0), 
+                    z = c(0, 50, 50), 
+                    xend = c(100, 100, 100)/3, 
+                    yend = c(100, 100, 100)/3, 
+                    zend = c(100, 100, 100)/3)
+
+ternplot <- ggtern(data = ternary, aes(x = Coral, y = Algae, z = Sponge, color = Year))+
+  geom_point(size = 3) +
+  theme_arrowdefault()+
+  theme_counterclockwise()+
+  theme_showarrows()+
+  geom_segment(data = lines, 
+               aes(x, y, z, 
+                   xend = xend, yend = yend, zend = zend), 
+               color = 'darkgrey', size = 1)+
+  theme_bvbw() +
+  facet_wrap(~ Site, nrow = 1)+
+  theme(strip.text.x = element_blank(), strip.background = element_blank())
+
+ternplot
+
+ggsave("//Staff/Home/SCIFAC/rovellal/DocumentsRedir/Projects/Chapter 2/Statistics/CCA_separate/trunk/pics/ternary.pdf", ternplot, width = 11, height = 6, useDingbats = FALSE)
+
+```
+
+The above shows that, considering relative contribution of corals, algae and sponges, there rarely is a "sponge phase" where these make up for a third of the combined cover of these three groups (which is not the same as a third of the community). All sites are in coral phase, but sites 1 and 2 especially so, whereas site 3 shows potential for alternate states. However, site 3 has high CCA cover. There is no evident phase shift over time in any of the sites. Note that this plot does not account for the other benthic groups in the community (most importantly CCA and other), thus it does not represent a ternary subdivision of the entire benthos. The plot does capture the components we are interested in and how they are related.
+
+# Community composition: ordination methods
+
+Getting an idea of how the community composition changes in time and across the three sites. See this about being able to use Bray-Curtis for compositional data https://stat.ethz.ch/pipermail/r-sig-ecology/2014-May/004506.html.
+
+## 1. Determination of the number of dimensions for nMDS.
+
+```{r, echo = FALSE, message = FALSE, results='hide', fig.keep='all'}
+
+# TODO: the below is the equivalent of dcast, leave for now but clunky and to do better
+
+
+all.frames <- all.frames[complete.cases(all.frames), ]
+
+frames.list <- split(all.frames, list(all.frames$Quadrat, all.frames$Site, all.frames$Year))
+frames.names<- which(names(frames.list) == "Q3.S3.2015") # gets the blank year out, may be automated later for any year
+frames.list <- frames.list[- frames.names]
+
+# keep cover only, then they just need to be bound by column
+
+cover.only <- as.data.frame(matrix(NA, nrow = nrow(frames.list[[1]]), ncol = length(frames.list)))
+
+
+for (i in 1:length(frames.list)) {
+  cover.only[,i] <- frames.list[[i]]$Cover
+}
+
+horizontal.frame <- cbind(sort(levels(factor(all.frames$Group_code))), cover.only)
+
+# change names
+
+names(horizontal.frame) <- c("Group_code", names(frames.list))
+
+replicates <- horizontal.frame[,-1]
+
+# transpose for Bray-Curtis
+
+transposedReps <- t(replicates)
+
+colnames(transposedReps) <- horizontal.frame[,1]
+
+glimpse(transposedReps)
+
+
+repBC <- vegdist(transposedReps, method = "bray")
+
+# following region is to determine how many dimensions are optimal for the MDS plot. chosen criterion is: when does the stress fall below 0.05? 
+
+dim <- 10 # this will do
+
+stressList <- vector(mode = "list", length = length(dim))
+
+for (i in 1:dim) {
+  fitTemp <- metaMDS(repBC, k = i, engine = "monoMDS", trymax = 30) # start the monoMDS engine for increasing k, check for convergence and stress to find optimal k
+  stressList[[i]] <- fitTemp$stress
+}
+
+stressVec <- unlist(stressList)
+
+```
+
+Convergence is reached for k = 2, 3 etc. after <30 random starts, so no need to pipe the result of an MDS run as starter of another one with previous.best.
+
+```{r fig.height = 4, fig.width = 5}
+
+screeFrame <- data.frame(1:10, stressVec)
+
+scree <- ggplot(data = screeFrame, aes(x = X1.10, y = stressVec))+
+  geom_point()+
+  geom_abline(intercept = 0.05, slope = 0, colour = "red")
+scree
+
+```
+
+k = 3 seems appropriate. k = 2 would be ideal of course, and in fact stress would be 0.06 for k = 2 so may as well use k = 2. k = 2  will need almost 500 iteration in the bit below but we can find convergence.
+
+## 2. MDS plot.
+
+```{r fig.height = 4, fig.width = 6, results='hide', fig.keep='all'}
+
+fit <- metaMDS(repBC, k = 2, engine = "monoMDS", trymax = 500) # this is a ***NON-METRIC*** MDS plot based on Bray-Curtis dissimilarity
+
+# make sure that the above converges
+
+distances <- as.data.frame(fit$points)
+distances$Names <- as.character(rownames(distances))
+for (i in 1:nrow(distances)) {
+  distances$Year[i] <- substr(distances$Names[i], nchar(distances$Names[i])-3, nchar(distances$Names[i]))
+}
+for (i in 1:nrow(distances)) {
+  distances$Site[i] <- substr(distances$Names[i], 4, 5)
+}
+for (i in 1:nrow(distances)) {
+  distances$Quadrat[i] <- substr(distances$Names[i], 1, 2)
+}
+
+# plot
+
+distancesMDS <- distances
+
+MDScomm <- MDSplot <- ggplot(data = distancesMDS, aes(x = MDS1, y = MDS2, colour = Site))+
+  geom_point(aes(fill = Site, shape = factor(Year)), size = 1.5, stroke = 1)+
+  scale_shape_manual(values = 0:10)+
+  scale_color_manual(values = c("grey50", "darkblue", "coral"))+
+  labs(x = "MDS1", y = "MDS2")+
+  theme_bw()+
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    axis.text.x=element_blank(),
+    axis.ticks.x=element_blank(),
+    axis.text.y=element_blank(),
+    axis.ticks.y=element_blank())
+MDSplot
+
+# ggsave("//Staff/Home/SCIFAC/rovellal/DocumentsRedir/Projects/Chapter 2/Statistics/trunk_FS_as_FS/pics/MDS.pdf", MDScomm, width = 4, height = 3, useDingbats = FALSE)
+
+```
+
+The above shows a rather clear separation between site 3 and 2. Site 1 more diverse. No obvious time effect.
+
+## 4. CAP
+
+```{r, fig.height = 4, fig.width = 6}
+
+# CAP starts from the species list
+
+dummyMatrix <- as.data.frame(cbind(distances$Year, distances$Site, distances$Quadrat)) # Site and Year frame
+colnames(dummyMatrix) <- c("Year", "Site", "Quadrat")
+rownames(dummyMatrix) <- rownames(transposedReps)
+
+# different formulas mean different ordinations, depending on the included variables
+
+CAPall <- capscale(transposedReps ~ Year + Site + Year*Site, dummyMatrix, 
+                   distance = "bray", add = T)
+
+components <- fortify(CAPall) # extract the coordinates from the cca objects calculated with capscale 
+components <- data.frame(lapply(components, function(x) {
+  x <- gsub("Year", "", x)
+  x <- gsub("Site", "", x)
+  x <- gsub("Mean", "", x)
+  return(x)
+}))
+
+components$CAP1 <- as.numeric(as.character(components$Dim1))
+components$CAP2 <- as.numeric(as.character(components$Dim2))
+components$Label <- gsub("spe", "", components$Label)
+
+
+# plotting region
+
+plotData <- subset(components, components$Score != "biplot" & components$Score != "constraints" &
+                     components$Score != "sites")
+plotData$ColorKey <- c(rep("Species", nrow(plotData[plotData$Score=="species",])), 
+                       rep("Year", 7), rep("Site", 3)) 
+# fix levels
+plotData$ColorKey <- factor(plotData$ColorKey, levels = unique(plotData$ColorKey))
+
+# new dataset for points layer, needed to overwrite aesthetics
+
+CAPplot <- ggplot(data = plotData[plotData$ColorKey != "Year" & plotData$Label != "UN",], aes(x = CAP1, y = CAP2, group = ColorKey))+
+  geom_hline(yintercept = 0, linetype = "dashed")+
+  geom_vline(xintercept = 0, linetype = "dashed")+
+  geom_segment(data = subset(plotData[plotData$Label != "UN" & plotData$Score == "species",]),
+               aes(x = 0, xend = CAP1, y = 0, yend = CAP2), color = "grey60", size = 0.1)+
+  geom_text(aes(label = Label, color = ColorKey, size = ColorKey))+
+  geom_point(data = plotData[plotData$ColorKey == "Year",], aes(x = CAP1, y = CAP2), color = "blue", size = 2)+
+  scale_color_manual(values = c("grey10", "red"))+
+  scale_size_discrete(range = c(3,5))+
+  theme_bw()+
+  labs(x = "CAP1", y = "CAP2")+
+  # scale_x_continuous(limits = c(-1.2,1.4))+
+  # scale_y_continuous(limits = c(-1.4,1.4))+
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank())
+
+CAPplot
+
+ggsave("//Staff/Home/SCIFAC/rovellal/DocumentsRedir/Projects/Chapter 2/Statistics/trunk_FS_as_FS/pics/CAP_fixed.pdf", CAPplot, width = 5, height = 3, useDingbats = FALSE)
+
+```
+
+```{r}
+
+# CAP starts from the species list
+
+dummyMatrix <- as.data.frame(cbind(distances$Year, distances$Site, distances$Quadrat)) # Site and Year frame
+colnames(dummyMatrix) <- c("Year", "Site", "Quadrat")
+rownames(dummyMatrix) <- rownames(transposedReps)
+
+# different formulas mean different ordinations, depending on the included variables
+
+CAPall <- capscale(transposedReps ~ Year + Site + Year*Site, dummyMatrix, 
+                   distance = "bray", add = T)
+
+components <- fortify(CAPall) # extract the coordinates from the cca objects calculated with capscale 
+components <- data.frame(lapply(components, function(x) {
+  x <- gsub("Year", "", x)
+  x <- gsub("Site", "", x)
+  x <- gsub("Mean", "", x)
+  return(x)
+}))
+
+components$CAP1 <- as.numeric(as.character(components$Dim1))
+components$CAP2 <- as.numeric(as.character(components$Dim2))
+components$Label <- gsub("spe", "", components$Label)
+
+
+# plotting region
+
+plotData <- subset(components, components$Score != "biplot" & components$Score != "constraints" &
+                     components$Score != "sites")
+plotData$ColorKey <- c(rep("Species", nrow(plotData[plotData$Score=="species",])), 
+                       rep("Year", 7), rep("Site", 3)) 
+# fix levels
+plotData$ColorKey <- factor(plotData$ColorKey, levels = unique(plotData$ColorKey))
+
+CAPplot <- ggplot(data = plotData, aes(x = CAP1, y = CAP2, group = ColorKey))+
+  geom_hline(yintercept = 0, linetype = "dashed")+
+  geom_vline(xintercept = 0, linetype = "dashed")+
+  geom_segment(data = subset(plotData, plotData$Score == "centroids"),
+               aes(x = 0, xend = CAP1, y = 0, yend = CAP2), 
+               arrow = arrow(length = unit(1/2, 'picas')))+
+  geom_text(aes(label = Label, color = ColorKey, size = ColorKey))+
+  scale_color_manual(values = c("grey50", "blue", "red"))+
+  scale_size_discrete(range = c(3,7))+
+  theme_bw()+
+  labs(x = "CAP1", y = "CAP2")+
+  scale_x_continuous(limits = c(-1.2,1.4))+
+  scale_y_continuous(limits = c(-1.4,1.4))+
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank())
+CAPplot
+
+```
+
+
+## 5. Permutational MANOVA
+
+We need this because of, among others, the repeated measurements.
+
+```{r}
+
+set.seed(42)
+
+dummyMatrix <- as.data.frame(cbind(distances$Year, distances$Site, distances$Quadrat)) # Site and Year frame
+colnames(dummyMatrix) <- c("Year", "Site", "Quadrat")
+rownames(dummyMatrix) <- rownames(transposedReps)
+
+adonis(transposedReps ~ Year + Site + Year*Site, 
+       data = dummyMatrix, permutations = 9999, method = "bray") # Do not forget the combination
+
+```
+
+Community composition changes across sites, with space explaining 60% of the variation in the community composition (*P* = 0.0001). May be used together with nMDS skipping the CAP (ugly and trivial) to show diversity across sites. This shows no effect of time in the composition of the community, i.e. community composition changes across sites but does not seem to change in time consistently. Then need to be careful as to why we carry on doing analysis that involve time. 
+
+# Summary
+
+No visible long-term temporal changes in cover of any of the benthic organisms at a global level, but large small-scale spatial heterogeneity. The community is dominated by hard corals for the most part, with CCA being usually the second most abundant biotic benthic group, followed by sponges and algae. So the main benthic competitors from a regime-shift perspective are hard corals, algae and sponges. When considering these three only, there rarely is a dominance of sponges or algae, nor there are signs of transition in time.
+The community composition changes across sites, with space explaining ~ 60% of the variation in composition. There are no signs of change in time, meaning that there are no shifts happening. 
+
+Next steps are to look at single benthic groups and explore their temporal dynamics and their spatial heterogeneity. Can we pick up even weak long-term increases or declines in cover of the benthic types? Can we pick up short-term changes in any of the benthic groups?

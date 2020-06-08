@@ -1,0 +1,1013 @@
+---
+title: 'Chapter 2: model fitting'
+author: "Alberto Rovellini"
+date: "8 March 2019"
+output:
+  html_document:
+    code_folding: hide
+    toc: yes
+    toc_float: yes
+  pdf_document:
+    toc: yes
+---
+
+This documents contains the statistical analysis performed on the community data from Buoy 3, Indonesia. 
+
+Three main steps are presented:
+
+1. I model % cover of the main 5 biotic benthic groups (i.e. hard corals, sponges, algae, CCA and others) as function of site, time and a combination of the two. This aims to answer the question of whether cover of single groups changes significantly in time and space. Ordination showed no effect of time on the composition of the community, but this step allows us to detect if cover of the single groups has changed over time at any of the sites, and how. We expect no global trend, as visualisation did no show any.
+
+  + I use linear mixed effects models with random intercepts assuming normal distribution of the errors. 
+  + I use time and site as fixed effects, and quadrat as random effect. 
+  + I use a continuous autocorrelation structure of type CAR1, to account for correlation between observations proportional to their proximity in time. 
+  + I do backwards model selection with LRT to pick the appropriate combination of fixed effects for each model. Because I have different fixed effects, I fit these models with ML. 
+  + I then fit a variance-covariance matrix that incorporates heteroskedasticity between quadrats to the best combination of fixed effects. The form varIdent(form = ~ v | g) means that we are allowing as many different variances as levels of g, so basically a variance per QuadratSite (see https://stat.ethz.ch/R-manual/R-devel/library/nlme/html/varIdent.html). This helps absorb the outliers and the broad variability that we have in some quadrats, and the residuals appear consistently improved when this is added. However, if using AIC or similar to determine whether or not we want to keep the model *with* the variance structure compared to the same model *without* it, the answer is almost invariably "drop it". Since the fits are incomparably better by allowing for between-quadrat heteroskedasticity, we ignore the information criteria comparisons and keep it in the models here.
+  + Finally, I re-fit the best model with REML and study the effects. 
+  + Model fit is evaluated with residual analysis. For this purpose, normalized residuals are employed. Normalized residuals account for both the heterogeneous variance and the correlation matrix that have been incorporated in the model and are more appropriate than the raw and standardized (a.k.a. Pearson) residuals to check the assumptions of a model that includes correlation and variance structures (see book "Linear Mixed-Effects Models Using R", from Galecki and Burzykowski 2013). Normalized residuals are like Pearson residuals but they account for correlation of the residuals (that can occur for models including autocorrelation).
+
+2. I model % cover of the 5 benthic groups as function of free space the previous year. I do this to answer the question of whether space that becomes free on the reef after mortality of the existing organisms is occupied by other groups, and which ones. I use LMM again, in a similar approach as above.
+
+3. Explore relationship between sponge % cover and sponge abundance. Same approach as points 1-2.
+
+```{r, echo = FALSE, include=FALSE, warning = FALSE}
+knitr::opts_chunk$set(echo = TRUE, width = 150)
+```
+
+```{r, message = FALSE, warning = FALSE}
+
+library(data.table)
+library(ggplot2)
+library(abind)
+library(dplyr)
+library(reshape2)
+library(lme4)
+library(nlme)
+library(effects)
+library(emmeans)
+
+```
+
+```{r fig.height = 12, fig.width = 15}
+
+all.frames <- read.csv("//Staff/Home/SCIFAC/rovellal/DocumentsRedir/Projects/Chapter 2/Statistics/trunk_FS_as_FS/quadratsData_CCA.csv", sep = ",")
+
+all.frames <- all.frames %>% mutate(
+  Group = factor(rep(c("SAND/SILT", "ALGAE", "CCA", "FREE SPACE", "CORAL", "OTHER", "SPONGE", "UNKNOWN"), nrow(all.frames)/8), levels = c("CORAL", "ALGAE", "CCA", "SPONGE", "OTHER", "UNKNOWN", "FREE SPACE", "SAND/RUBBLE"))
+)
+
+all.frames$FG <- factor(all.frames$FG, levels = c("HC", "AL", "CA", "SP", "OT", "UN", "FS", "AB"))
+
+names(all.frames) <- c("Group_code", "Cover", "Year", "Site", "Quadrat", "Group_name")
+
+glimpse(all.frames)
+
+# fill gap years (2009-2013) for time series plotting
+
+dummy.frame <- all.frames[all.frames$Year == 2006,]
+dummy.frame$Cover <- rep(NA, dim(dummy.frame)[1])
+
+missing.years <- 2009:2013
+
+dummy.list <- vector(mode = "list", length = length(missing.years))
+
+for(i in 1:length(missing.years)) {
+  dummy.list[[i]] <- dummy.frame
+  dummy.list[[i]]$Year <- rep(missing.years[i], dim(dummy.frame)[1]) 
+}
+
+all.frames.ts <- rbind(all.frames[all.frames$Year %in% 2006:2008, ], rbindlist(dummy.list), all.frames[all.frames$Year %in% 2014:2017,])
+
+```
+
+# Spatio-temporal changes in % cover with linear mixed effects models (Set 1)
+
+```{r}
+
+# get one df for each group
+
+all.frames.1 <- all.frames
+
+## get number of years since 2006
+all.frames.1$Year <- all.frames.1$Year-min(all.frames.1$Year)
+all.frames.1$Quadrat.Site <- interaction(all.frames.1$Site, all.frames.1$Quadrat)
+
+HC <- all.frames.1[all.frames.1$Group_code == "HC",]
+SP <- all.frames.1[all.frames.1$Group_code == "SP",]
+AL <- all.frames.1[all.frames.1$Group_code == "AL",]
+CA <- all.frames.1[all.frames.1$Group_code == "CA",]
+OT <- all.frames.1[all.frames.1$Group_code == "OT",]
+
+```
+
+By modelling time as continuous variable that increases from 2006, I'm looking for an effect of time on the dependent variable, i.e. % cover of each group. Effectively we are looking at long-term changes (although this word is to be avoided of course), as we are modelling the benthos as a function of time. I'm using linear mixed effects models (LMM) with random intercept and fixed slope, that use the unique quadrats (i.e. term QuadratSite) as random factor. I am selecting for the best model among a set of candidates that incorporate different combinations of fixed effects. I am fitting models with maximum likelihood (ML) first, because I am testing different combinations of the fixed effects. I then operate model selection by looking at likelihood ratio tests (LTR). When I have picked my model, I refit it with Restricled Maximum Likelihood (REML). 
+
+I use nlme::lme() instead of lme4::lmer() because the former allows me to fit correlation and variance structures, and it is enough to handle my only random factor.
+
+### 1.1 Corals
+
+```{r, fig.width = 12, fig.height = 5}
+
+# do it with nlme::lme(). Fitting correlation structure from the beginning.
+
+HC.null <- nlme::lme(Cover ~ 1, random = ~ 1 | Quadrat.Site, data = HC, correlation = corCAR1(form = ~ Year | Quadrat.Site), method = "ML") # intercept model
+HC.time <- update(HC.null, . ~ . + Year) # year
+HC.site <- update(HC.null, . ~ . + Site) # site
+HC.add <- update(HC.time, . ~ . + Site) # year + site
+HC.all <- update(HC.add, . ~ . + Site * Year) # combination
+
+# backwards selection with LRT
+
+anova(HC.all, HC.add) # interaction not significant, p = 0.3803
+anova(HC.add, HC.site) # time not significant, p = 0.3988
+anova(HC.add, HC.time) # must keep site, p <.0001
+
+# fit variance structure
+
+HC.site.var <- update(HC.site, weights = varIdent(form = ~ 1 | Quadrat.Site))
+
+# re-fit final model with REML
+
+HC.model <- update(HC.site.var, method = "REML")
+
+summary(HC.model) # can study the coefficients here
+
+# Phi = 0.8737069
+
+jpeg("//Staff/Home/SCIFAC/rovellal/DocumentsRedir/Projects/Defense/residuals/Ch4_LMM_HC_Site.jpeg", width = 11, height = 3.5, units = "in", res = 300) 
+par(mfrow = c(1, 3)) 
+plot(resid(HC.model, type = "normalized")) # residuals quite big
+hist(residuals(HC.model, type = "normalized"))
+qqnorm(residuals(HC.model, type = "normalized"))
+qqline(residuals(HC.model, type = "normalized")) # 3 possible outliers
+dev.off()
+
+# post-hoc pairwise analysis: tukey with bonferroni correction
+
+em_HC <- emmeans(HC.model, pairwise ~ Site)
+
+summary(em_HC, adjust = "bonferroni")
+
+```
+Only site effect (LRT p-value <.0001). Site 3 is different from site 1 (p = 0.0048) and from site 2 (p = 0.0003). Sites 1 and 2 are not different (p = 0.4)
+
+### 1.2 Sponges
+
+```{r, fig.width = 12, fig.height = 5}
+
+# do it with nlme::lme(). ML to pick fixed effects, then REML to pick AR1 and variance on best model out of ML
+
+SP.null <- nlme::lme(Cover ~ 1, random = ~ 1 | Quadrat.Site, data = SP, correlation = corCAR1(form = ~ Year | Quadrat.Site), method = "ML") # intercept model
+SP.time <- update(SP.null, . ~ . + Year) # year
+SP.site <- update(SP.null, . ~ . + Site) # site
+SP.add <- update(SP.time, . ~ . + Site) # year + site
+SP.all <- update(SP.add, . ~ . + Site * Year) # combination
+
+# backwards selection with LRT
+
+anova(SP.all, SP.add) # interaction not significant, p = 0.2221
+anova(SP.add, SP.site) # year not significant, p = 0.3261
+anova(SP.add, SP.time) # site is significant, p = 0.0018
+
+# fit variance structure
+
+SP.site.var <- update(SP.site, weights = varIdent(form = ~ 1 | Quadrat.Site), control = lmeControl(opt='optim')) # variance structure
+
+# re-fit final model with REML
+
+SP.model <- update(SP.site.var, method = "REML")
+
+summary(SP.model) # can study the coefficients here
+
+# Phi = 0.5496824
+
+jpeg("//Staff/Home/SCIFAC/rovellal/DocumentsRedir/Projects/Defense/residuals/Ch4_LMM_SP_Site.jpeg", width = 11, height = 3.5, units = "in", res = 300) 
+par(mfrow = c(1, 3)) 
+plot(resid(SP.model, type = "normalized")) # residuals vs fitted: seems okay
+hist(residuals(SP.model, type = "normalized"))
+qqnorm(residuals(SP.model, type = "normalized"))
+qqline(residuals(SP.model, type = "normalized")) # seems okay too
+dev.off()
+
+# post-hoc pairwise analysis: bonferroni correction
+
+em_SP <- emmeans(SP.model, pairwise ~ Site)
+
+summary(em_SP, adjust = "bonferroni")
+
+```
+
+Best (or most parsimonious) model only includes site (LRT p-value = 0.0018). Site 3 is different from 1 and 2.
+
+### 1.3 Algae
+
+```{r, fig.width = 12, fig.height = 5}
+
+# do it with nlme::lme(). ML to pick fixed effects, then REML to pick AR1 and variance on best model out of ML
+
+AL.null <- nlme::lme(Cover ~ 1, random = ~ 1 | Quadrat.Site, data = AL, correlation = corCAR1(form = ~ Year | Quadrat.Site), method = "ML") # intercept model
+AL.time <- update(AL.null, . ~ . + Year) # year
+AL.site <- update(AL.null, . ~ . + Site) # site
+AL.add <- update(AL.time, . ~ . + Site) # year + site
+AL.all <- update(AL.add, . ~ . + Site * Year) # combination
+
+# backwards selection with LRT
+
+anova(AL.all, AL.add) # interaction not significant, p = 0.9725
+anova(AL.add, AL.site) # time not significant, p = 0.805
+anova(AL.add, AL.time) # site significant, p = 0.0046
+
+# fit variance structure
+
+AL.site.var <- update(AL.site, weights = varIdent(form = ~ 1 | Quadrat.Site)) # variance structure
+
+# re-fit final model with REML
+
+AL.model <- update(AL.site.var, method = "REML")
+
+summary(AL.model) # can study the coefficients here
+
+# Phi = 0.4941525
+
+jpeg("//Staff/Home/SCIFAC/rovellal/DocumentsRedir/Projects/Defense/residuals/Ch4_LMM_AL_Site.jpeg", width = 11, height = 3.5, units = "in", res = 300) 
+par(mfrow = c(1, 3)) 
+plot(resid(AL.model, type = "normalized")) # residuals vs fitted: one outlier
+hist(residuals(AL.model, type = "normalized")) # a bit of a hump, but no real reason to suspect a bimodal distribution
+qqnorm(residuals(AL.model, type = "normalized"))
+qqline(residuals(AL.model, type = "normalized")) # one outlier
+dev.off()
+
+# post-hoc pairwise analysis: bonferroni correction
+
+em_AL <- emmeans(AL.model, pairwise ~ Site)
+
+summary(em_AL, adjust = "bonferroni")
+
+```
+
+Best model is site only (LRT p-value = 0.0046). Site 3 is different from site 2 (p = 0.0192), but not from S1. S1 and S2 are not different.
+
+### 1.4 CCA
+
+```{r, fig.width = 12, fig.height = 5}
+
+# do it with nlme::lme(). ML to pick fixed effects, then REML to pick AR1 and variance on best model out of ML
+
+CA.null <- nlme::lme(Cover ~ 1, random = ~ 1 | Quadrat.Site, data = CA, correlation = corCAR1(form = ~ Year | Quadrat.Site), method = "ML") # intercept model
+CA.time <- update(CA.null, . ~ . + Year) # year
+CA.site <- update(CA.null, . ~ . + Site) # site
+CA.add <- update(CA.time, . ~ . + Site) # year + site
+CA.all <- update(CA.add, . ~ . + Site * Year) # combination
+
+# backwards selection with LRT
+
+anova(CA.all, CA.add) # must keep interaction, p = 0.0121
+anova(CA.add, CA.site) # time alone not significant, p = 0.4931
+anova(CA.add, CA.time) # must keep site, p <.0001
+
+# fit variance structure
+
+CA.all.var <- update(CA.all, weights = varIdent(form = ~ 1 | Quadrat.Site)) # variance structure
+
+# re-fit final model with REML
+
+CA.model <- update(CA.all.var, method = "REML")
+
+summary(CA.model) # can study the coefficients here
+
+# Phi = 0.5295929
+
+jpeg("//Staff/Home/SCIFAC/rovellal/DocumentsRedir/Projects/Defense/residuals/Ch4_LMM_CA_Site_Year_SiteYear.jpeg", width = 11, height = 3.5, units = "in", res = 300) 
+par(mfrow = c(1, 3)) 
+plot(resid(CA.model, type = "normalized")) # potentially one outlier
+hist(residuals(CA.model, type = "normalized"))
+qqnorm(residuals(CA.model, type = "normalized"))
+qqline(residuals(CA.model, type = "normalized")) 
+dev.off()
+
+# post-hoc pairwise analysis: bonferroni correction
+
+em_CA <- emtrends(CA.model, pairwise ~ Site, var = "Year") # year is continuous and it features so we have to use emtrends
+
+summary(em_CA, adjust = "bonferroni")
+
+# emmip(CA.model, ~ Year | Site, cov.reduce = range, CIs = T) # this was to check, use the effects plot for visualisation as that is better
+
+```
+
+Interaction model is best model (LRT p-value = 0.0121). Difference between S1-S3 (p = 0.0136) but not between any other site. Output of summary here shows Year.trend, that is it compares the slope of the relationship between Year and Cover across sites. Marginal mean for site 1 are the same as in summary of the selected model.
+
+### 1.5 Other
+
+```{r, fig.width = 12, fig.height = 5}
+
+# do it with nlme::lme(). ML to pick fixed effects, then REML to pick AR1 and variance on best model out of ML
+
+OT.null <- nlme::lme(Cover ~ 1, random = ~ 1 | Quadrat.Site, data = OT, correlation = corCAR1(form = ~ Year | Quadrat.Site), method = "ML") # intercept model
+OT.time <- update(OT.null, . ~ . + Year) # year
+OT.site <- update(OT.null, . ~ . + Site) # site
+OT.add <- update(OT.time, . ~ . + Site) # year + site
+OT.all <- update(OT.add, . ~ . + Site * Year) # combination
+
+# backwards selection with LRT
+
+anova(OT.all, OT.add) # must keep interaction, p = 4e-04
+anova(OT.add, OT.site) # year is significant, p = 0.0215
+anova(OT.add, OT.time) # site is significant, p = 0.0089
+
+# fit variance structure
+
+OT.all.var <- update(OT.all, weights = varIdent(form = ~ 1 | Quadrat.Site)) # variance structure
+
+# re-fit final model with REML
+
+OT.model <- update(OT.all.var, method = "REML", control = lmeControl(opt='optim'))
+
+summary(OT.model) # OTn study the coefficients here
+
+# Phi = 0.8590611
+
+jpeg("//Staff/Home/SCIFAC/rovellal/DocumentsRedir/Projects/Defense/residuals/Ch4_LMM_OT_Site_YEar_SiteYear.jpeg", width = 11, height = 3.5, units = "in", res = 300) 
+par(mfrow = c(1, 3)) 
+plot(resid(OT.model, type = "normalized")) # 4-5 outliers
+hist(residuals(OT.model, type = "normalized"))
+qqnorm(residuals(OT.model, type = "normalized"))
+qqline(residuals(OT.model, type = "normalized"))
+dev.off()
+
+# post-hoc pairwise analysis: bonferroni correction
+
+em_OT <- emtrends(OT.model, pairwise ~ Site, var = "Year") # year is continuous and it features so we have to use emtrends
+
+summary(em_OT, adjust = "bonferroni")
+
+# emmip(OT.model, ~ Year | Site, cov.reduce = range, CIs = T) # this was to check, use the effects plot for visualisation as that is better
+
+```
+
+Best model is interaction of year and site (LRT p-value = 4e-04). Site-specific effect of time on other benthic organisms. There is an outlier quadrat in site 1 (S1Q1), that is likely responsible for the decline that the model detects. Re-running the model without this quadrat may dissipate the effect. S1 is different from S2 (0.0412) and from S3 (p = 0.0313), likely driven by the outlier. Large between-sites variability also in the dynamics. Shifts are very contextual.
+
+## Effects plots
+
+Plotting the effects of the combination of Site and Year on the % cover of the groups, and comparing with the data.
+
+Preparing species data frames for the effects plots (we need the time gaps).
+
+```{r}
+
+all.frames.2 <- all.frames.ts
+
+## get number of years since 2006
+all.frames.2$Year <- all.frames.2$Year-min(all.frames.2$Year)
+all.frames.2$Quadrat.Site <- interaction(all.frames.2$Site, all.frames.2$Quadrat)
+
+HC.p <- all.frames.2[all.frames.2$Group_code == "HC",]
+SP.p <- all.frames.2[all.frames.2$Group_code == "SP",]
+AL.p <- all.frames.2[all.frames.2$Group_code == "AL",]
+CA.p <- all.frames.2[all.frames.2$Group_code == "CA",]
+OT.p <- all.frames.2[all.frames.2$Group_code == "OT",]
+
+```
+
+### 1.1 Corals
+
+```{r, fig.width = 7.5, fig.height = 2.8}
+
+ef.HC <- data.frame(Effect("Site", HC.model,  xlevel = 10))
+
+p <- ggplot()+
+  geom_hline(data = ef.HC, aes(yintercept = fit, group = Site), colour = "red")+
+  geom_hline(data = ef.HC, aes(yintercept = lower, group = Site), linetype = "dashed", color = "darkgrey")+
+  geom_hline(data = ef.HC, aes(yintercept = upper, group = Site), linetype = "dashed", color = "darkgrey")+
+  geom_line(data = HC.p, aes(x = Year + 2006, y = Cover, group = Quadrat, color = Quadrat), size = 1)+
+  # scale_color_brewer(palette = "Set1")+
+  scale_color_grey(start = 0, end = 0.9)+
+  scale_x_continuous(breaks = seq(2006, 2018, 2))+
+  theme_bw()+
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank())+
+  theme(plot.title = element_text(size=14, vjust=2))+
+  theme(axis.title.x = element_text(size=11,vjust=-0.5),
+        axis.title.y = element_text(size=11,vjust=0.5))+
+  theme(axis.text.x=element_text(size=11, angle = 45, 
+                                 hjust = 1, vjust = .9))+
+  theme(axis.text.y=element_text(size=11))+
+  facet_grid(~ Site)+
+  theme(strip.text.x = element_blank(), strip.background = element_blank())
+p
+
+ggsave("//Staff/Home/SCIFAC/rovellal/DocumentsRedir/Projects/Chapter 2/Statistics/trunk_FS_as_FS/pics/HC_model_BW.pdf", p, width = 7.5, height = 2.5)
+  
+```
+
+Coral cover does not show consistent and monotonous increase or decline trends. All the model tells me is that there is a difference across sites in how corals change in time. Goodness of fit depends on the sites. Some sites have large within-site variation. Apparent across-site heteroskedasticity exacerbated by Q1S1 (soft-coral dominated). 
+
+### 1.2 Sponges
+
+```{r, fig.width = 7.5, fig.height = 2.8}
+
+ef.SP <- data.frame(Effect("Site", SP.model,  xlevel = 10))
+
+p <- ggplot()+
+  geom_hline(data = ef.SP, aes(yintercept = fit, group = Site), colour = "red")+
+  geom_hline(data = ef.SP, aes(yintercept = lower, group = Site), linetype = "dashed", color = "darkgrey")+
+  geom_hline(data = ef.SP, aes(yintercept = upper, group = Site), linetype = "dashed", color = "darkgrey")+
+  geom_line(data = SP.p, aes(x = Year + 2006, y = Cover, group = Quadrat, color = Quadrat), alpha = .8, size = 1.2)+
+# scale_color_brewer(palette = "Set1")+
+  scale_color_grey(start = 0, end = 0.9)+
+  scale_x_continuous(breaks = seq(2006, 2018, 2))+
+  theme_bw()+
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank())+
+  theme(plot.title = element_text(size=14, vjust=2))+
+  theme(axis.title.x = element_text(size=11,vjust=-0.5),
+        axis.title.y = element_text(size=11,vjust=0.5))+
+  theme(axis.text.x=element_text(size=11, angle = 45, 
+                                 hjust = 1, vjust = .9))+
+  theme(axis.text.y=element_text(size=11))+
+  facet_grid(~ Site)+
+  theme(strip.text.x = element_blank(), strip.background = element_blank())
+p
+
+ggsave("//Staff/Home/SCIFAC/rovellal/DocumentsRedir/Projects/Chapter 2/Statistics/trunk_FS_as_FS/pics/SP_model_BW.pdf", p, width = 7.5, height = 2.5)
+
+```
+
+Some level of site difference (interesting to link to the across-site differences in community composition). No change over time. High within-site variability. 
+
+### 1.3 Algae
+
+```{r, fig.width = 7.5, fig.height = 2.8}
+
+ef.AL <- data.frame(Effect("Site", AL.model,  xlevel = 10))
+
+p <- ggplot()+
+  geom_hline(data = ef.AL, aes(yintercept = fit, group = Site), colour = "red")+
+  geom_hline(data = ef.AL, aes(yintercept = lower, group = Site), linetype = "dashed", color = "darkgrey")+
+  geom_hline(data = ef.AL, aes(yintercept = upper, group = Site), linetype = "dashed", color = "darkgrey")+
+  geom_line(data = AL.p, aes(x = Year + 2006, y = Cover, group = Quadrat, color = Quadrat), alpha = .8, size = 1.2)+
+# scale_color_brewer(palette = "Set1")+
+  scale_color_grey(start = 0, end = 0.9)+
+  scale_x_continuous(breaks = seq(2006, 2018, 2))+
+  theme_bw()+
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank())+
+  theme(plot.title = element_text(size=14, vjust=2))+
+  theme(axis.title.x = element_text(size=11,vjust=-0.5),
+        axis.title.y = element_text(size=11,vjust=0.5))+
+  theme(axis.text.x=element_text(size=11, angle = 45, 
+                                 hjust = 1, vjust = .9))+
+  theme(axis.text.y=element_text(size=11))+
+  facet_grid(~ Site)+
+  theme(strip.text.x = element_blank(), strip.background = element_blank())
+p
+
+ggsave("//Staff/Home/SCIFAC/rovellal/DocumentsRedir/Projects/Chapter 2/Statistics/trunk_FS_as_FS/pics/AL_model_BW.pdf", p, width = 7.5, height = 2.5)
+
+```
+
+Similar to sponges, poor fit. Some site effect. 
+
+### 1.4 CCA
+
+```{r, fig.width = 7.5, fig.height = 2.8}
+
+ef.time.CA <- data.frame(effect("Year * Site", CA.model,  xlevel = 10))
+
+ef.time.CA$Year <- ef.time.CA$Year + 2006
+
+p <- ggplot()+
+  geom_line(data = ef.time.CA, aes(x=Year, y=fit, group=Site), colour = "red")+
+  geom_line(data = ef.time.CA,aes(x = Year, y = lower), linetype = "dashed", color = "darkgrey")+
+  geom_line(data = ef.time.CA,aes(x = Year, y = upper), linetype = "dashed", color = "darkgrey")+
+  geom_line(data = CA.p, aes(x = Year + 2006, y = Cover, group = Quadrat, color = Quadrat), alpha = .8, size = 1.2)+
+# scale_color_brewer(palette = "Set1")+
+  scale_color_grey(start = 0, end = 0.9)+
+  scale_x_continuous(breaks = seq(2006, 2018, 2))+
+  theme_bw()+
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank())+
+  theme(plot.title = element_text(size=14, vjust=2))+
+  theme(axis.title.x = element_text(size=11,vjust=-0.5),
+        axis.title.y = element_text(size=11,vjust=0.5))+
+  theme(axis.text.x=element_text(size=11, angle = 45, 
+                                 hjust = 1, vjust = .9))+
+  theme(axis.text.y=element_text(size=11))+
+  facet_grid(~ Site)+
+  theme(strip.text.x = element_blank(), strip.background = element_blank())
+p
+
+ggsave("//Staff/Home/SCIFAC/rovellal/DocumentsRedir/Projects/Chapter 2/Statistics/trunk_FS_as_FS/pics/CA_model_BW.pdf", p, width = 7.5, height = 2.5)
+  
+```
+
+With the exception of an increase at S1Q1 only due to the fact that it was covered by soft coral at the beginning and then it emerged in the pictures as soft coral died off, CCA seems to decline in time quite uniformly.
+
+### 1.5 Other
+
+```{r, fig.width = 7.5, fig.height = 2.8}
+
+ef.time.OT <- data.frame(effect("Year * Site", OT.model,  xlevel = 10))
+
+ef.time.OT$Year <- ef.time.OT$Year + 2006
+
+p <- ggplot()+
+  geom_line(data = ef.time.OT, aes(x=Year, y=fit, group=Site), colour = "red")+
+  geom_line(data = ef.time.OT,aes(x = Year, y = lower), linetype = "dashed", color = "darkgrey")+
+  geom_line(data = ef.time.OT,aes(x = Year, y = upper), linetype = "dashed", color = "darkgrey")+
+  geom_line(data = OT.p, aes(x = Year + 2006, y = Cover, group = Quadrat, color = Quadrat), alpha = .8, size = 1.2)+
+# scale_color_brewer(palette = "Set1")+
+  scale_color_grey(start = 0, end = 0.9)+
+  scale_x_continuous(breaks = seq(2006, 2018, 2))+
+  theme_bw()+
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank())+
+  theme(plot.title = element_text(size=14, vjust=2))+
+  theme(axis.title.x = element_text(size=11,vjust=-0.5),
+        axis.title.y = element_text(size=11,vjust=0.5))+
+  theme(axis.text.x=element_text(size=11, angle = 45, 
+                                 hjust = 1, vjust = .9))+
+  theme(axis.text.y=element_text(size=11))+
+  facet_grid(~ Site)+
+  theme(strip.text.x = element_blank(), strip.background = element_blank())
+p
+
+ggsave("//Staff/Home/SCIFAC/rovellal/DocumentsRedir/Projects/Chapter 2/Statistics/trunk_FS_as_FS/pics/OT_model_BW.pdf", p, width = 7.5, height = 2.5)
+  
+```
+
+Decline at site 1, increase at site 3. Very evident outlier quadrat at site 1, likely to influence the model. Goodness of fit varies with site.
+
+***
+
+In summary, weak temporal changes that vary between sites for CCA and other organisms (mostly soft corals and ascidians). No evident long-term temporal changes in cover of hard corals, sponges and algae, which do show spatial differences though. Sponges and algae show within-site variability, and larger relative changes between years. Can free space predict how much sponges or algae we will have next year? 
+
+So this step says that time has no effect in the change of single groups like hard corals, algae and sponges. CCA and soft corals instead do change in time, and they do so in different ways across sites. The spatial heterogeneity is high even across replicate sites (and also within them, although to lesser extent).
+
+# Free space as a lagged predictor of cover of the benthic groups (Set 2)
+
+I am keeping this analysis separated from the above because the dataset is smaller here (we have to drop years that do not have a previous year from the analysis).
+
+Using LMM, I tested the hypothesis that free space this year is a good predictor of the cover of benthic groups next year. In other words, we are looking for a lagged relationship between free space and the cover of the main benthic types. I used LMM because it allows for the incorporation of autocorrelation structure, appropriate with the temporal structure in the data, but it also allows to account for QuadratSite as random effect, which GLS would not. Free space here includes only rock, rubble and dead coral. 
+
+```{r}
+
+# get rid of last all_frame column as it contains information that is no longer needed (it was for the plot only)
+
+all.frames <- all.frames[,-dim(all.frames)[2]]
+
+# first, we need to add an empty frame with NAs for 2015 S3 Q3.
+
+groups.levels <- levels(factor(all.frames$Group_code))
+
+dummy2015 <- data.frame(groups.levels, rep(NA, length(groups.levels)), rep(2015, length(groups.levels)),
+                        rep("S3", length(groups.levels)), rep("Q3", length(groups.levels)))
+names(dummy2015) <- names(all.frames)
+
+# now bind it to all_frames
+
+frames.growth <- rbind(all.frames, dummy2015)
+
+frames.growth <- frames.growth[with(frames.growth, order(Year, Site, Quadrat)),]
+
+lvec <- length(groups.levels)*3*5
+
+frames.growth$Cover.t1 <- c(frames.growth$Cover[-c(1:lvec)], rep(NA, lvec))
+
+frames.growth$Cover.t1[c(((lvec*2)+1):(lvec*3))] <- NA # gets rid of 2014 in 2008
+ 
+frames.growth$Year.t1 <- rep(c(2007, 2008, NA, 2015, 2016, 2017, NA), each = lvec) # add column for t+1
+
+for (i in 1:nrow(frames.growth)) {
+  frames.growth$Gap[i] <- paste(substr(frames.growth$Year[i], 3, 4), 
+                                substr(frames.growth$Year.t1[i], 3, 4), sep = "-")
+}
+
+# introduce three columns here: free space last year, CCA last year, CCA + free space last year (i.e. FS from other analysis)
+
+fs.cover.t0 <- frames.growth[frames.growth$Group_code == "FS",]$Cover
+
+fs.template <- vector(mode = "double", length = length(fs.cover.t0) * nrow(frames.growth)/length(fs.cover.t0))
+
+for (i in 1:length(fs.template)) {
+  fs.template[i] <- fs.cover.t0[ceiling(i/(nrow(frames.growth)/length(fs.cover.t0)))]
+ }
+
+frames.growth$FS_t0 <- fs.template
+
+frames.growth$QuadratSite <- paste(frames.growth$Quadrat, frames.growth$Site, sep = "")
+
+# added on 28/11. We need to replace Cover.t1 of S3Q3 2015 with NA for the sake of model fitting later on, or else it will fit the model with intercept or site only to that data point too, and the final object will be long 74 instead of 73 like all the others. That is a problem for model selection. Still have to double-check this, and also we may be able to just eliminate the bit above instead
+
+for (i in 1:nrow(frames.growth)) {
+  if(frames.growth$Year[i] == 2015 & frames.growth$QuadratSite[i] == "Q3S3") {
+    frames.growth$Cover.t1[i] <- NA
+  }
+}
+
+# need to set year = 0 for 2006, i.e. treat time as continuous again
+
+frames.growth$Year <- frames.growth$Year - 2006
+
+# added 17/01/2018
+
+# test for effect of free space on change on % cover instead of on % cover
+
+```
+
+## Model fitting
+
+Procedure is as above: fit series of candidate models with ML to pick the fixed effect combination that is most appropriate. Because here the fixed effects change (only space, space and site, space, site and their interaction), we cannot use REML. Once we get the best candidate model, we re-fit it with REML. 
+
+### 2.1 Corals
+
+```{r, fig.width = 12, fig.height = 5}
+
+# first use ML to pick the relevant fixed effects
+
+coral.null <- nlme::lme(Cover.t1 ~ 1,
+                        random = ~ 1 | QuadratSite, 
+                        data = frames.growth[frames.growth$Group_code == "HC",],
+                        na.action = "na.omit",
+                        method = "ML",
+                        correlation = corCAR1(value = 0.2, form = ~ Year | QuadratSite))
+
+coral.fs <- update(coral.null, . ~ . + FS_t0)
+coral.site <- update(coral.null, . ~ . + Site)
+coral.add <- update(coral.fs, . ~ . + Site)
+coral.all <- update(coral.add, . ~ . + FS_t0 * Site)
+
+# backwards selection
+
+anova(coral.all, coral.add) # no interaction, p = 0.3783
+anova(coral.add, coral.fs) # site matters, p = <.0001
+anova(coral.add, coral.site) # free space does not matter, p = 0.5676
+
+# site matters, and we knew it from above. No lagged role of free space
+
+# fit variance structure
+
+coral.site.var <- update(coral.site, weights = varIdent(form = ~ 1 | QuadratSite), control = lmeControl(opt='optim', msMaxIter = 100))
+
+# refit with REML
+
+coral.model <- update(coral.site.var, method = "REML")
+
+summary(coral.model)
+
+# Phi = 0.8628023
+
+jpeg("//Staff/Home/SCIFAC/rovellal/DocumentsRedir/Projects/Defense/residuals/Ch4_LMM_HC_FS.jpeg", width = 11, height = 3.5, units = "in", res = 300)
+par(mfrow = c(1, 3))
+plot(resid(coral.model, type = "normalized")) 
+hist(residuals(coral.model, type = "normalized"))
+qqnorm(residuals(coral.model, type = "normalized"))
+qqline(residuals(coral.model, type = "normalized")) 
+dev.off()
+
+# post-hoc pairwise analysis: bonferroni correction
+
+em_HC_FS <- emmeans(coral.model, pairwise ~ Site)
+
+summary(em_HC_FS, adjust = "bonferroni")
+
+```
+
+No lagged relationship between free space and coral cover (as expected). Marginal means are similar, but not identical, to ones from HC.model. Reason being, the input dataset is slightly smaller.
+
+### 2.2 Sponges
+
+```{r, fig.width = 12, fig.height = 5}
+
+# first use ML to pick the relevant fixed effects
+
+sponge.null <- nlme::lme(Cover.t1 ~ 1,
+                         random = ~ 1 | QuadratSite, 
+                         data = frames.growth[frames.growth$Group_code == "SP",],
+                         na.action = "na.omit",
+                         method = "ML",
+                         correlation = corCAR1(value = 0.2, form = ~ Year | QuadratSite))
+
+sponge.fs <- update(sponge.null, . ~ . + FS_t0)
+sponge.site <- update(sponge.null, . ~ . + Site)
+sponge.add <- update(sponge.fs, . ~ . + Site)
+sponge.all <- update(sponge.add, . ~ . + FS_t0 * Site)
+
+# backwards selection
+
+anova(sponge.all, sponge.add) # interaction not significant, p = 0.6891
+anova(sponge.add, sponge.fs) # site matters, p = 7e-04
+anova(sponge.add, sponge.site) # free space does not matter, p = 0.9598
+
+# site matters, and we knew it from above. No lagged role of free space. Still carry on
+
+# fit variance structure
+
+sponge.site.var <- update(sponge.site, weights = varIdent(form = ~ 1 | QuadratSite))
+
+# re-fit with REML
+
+sponge.model <- update(sponge.site, method = "REML")
+
+summary(sponge.model)
+
+# Phi = 0.4246314
+
+jpeg("//Staff/Home/SCIFAC/rovellal/DocumentsRedir/Projects/Defense/residuals/Ch4_LMM_SP_FS.jpeg", width = 11, height = 3.5, units = "in", res = 300) 
+par(mfrow = c(1, 3))
+plot(resid(sponge.model, type = "normalized")) # outliers, or slightly longer right tail
+hist(residuals(sponge.model, type = "normalized"))
+qqnorm(residuals(sponge.model, type = "normalized"))
+qqline(residuals(sponge.model, type = "normalized")) 
+dev.off()
+
+# post-hoc pairwise analysis: bonferroni correction
+
+em_SP_FS <- emmeans(sponge.model, pairwise ~ Site)
+
+summary(em_SP_FS, adjust = "bonferroni")
+
+```
+
+No lagged effect of free space on sponge cover.
+
+### 2.3 Algae
+
+```{r, fig.width = 12, fig.height = 5}
+
+# first use ML to pick the relevant fixed effects
+
+algae.null <- nlme::lme(Cover.t1 ~ 1,
+                        random = ~ 1 | QuadratSite, 
+                        data = frames.growth[frames.growth$Group_code == "AL",],
+                        na.action = "na.omit",
+                        method = "ML",
+                        correlation = corCAR1(value = 0.2, form = ~ Year | QuadratSite))
+
+algae.fs <- update(algae.null, . ~ . + FS_t0)
+algae.site <- update(algae.null, . ~ . + Site)
+algae.add <- update(algae.fs, . ~ . + Site)
+algae.all <- update(algae.add, . ~ . + FS_t0 * Site)
+
+# backwards selection
+
+anova(algae.all, algae.add) # interaction not significant, p = 0.2629
+anova(algae.add, algae.fs) # site matters, p = 0.0012
+anova(algae.add, algae.site) # free space matters, p = 0.0398
+
+# fit variance structure
+
+algae.add.var <- update(algae.add, weights = varIdent(form = ~ 1 | QuadratSite))
+
+# refit with REML
+
+algae.model <- update(algae.add.var, method = "REML")
+
+summary(algae.model) 
+
+# Phi = 0.3948518
+
+jpeg("//Staff/Home/SCIFAC/rovellal/DocumentsRedir/Projects/Defense/residuals/Ch4_LMM_AL_FS.jpeg", width = 11, height = 3.5, units = "in", res = 300) 
+par(mfrow = c(1, 3))
+plot(resid(algae.model, type = "normalized")) # rather "fat" distribution
+hist(residuals(algae.model, type = "normalized"))
+qqnorm(residuals(algae.model, type = "normalized"))
+qqline(residuals(algae.model, type = "normalized")) 
+dev.off()
+
+# post-hoc pairwise analysis: bonferroni correction
+
+AL_grid <- ref_grid(algae.model, data = frames.growth[frames.growth$Group_code == "AL",])
+
+summary(emmeans(AL_grid, pairwise ~ Site, type = "response"))
+summary(emmeans(AL_grid, "FS_t0", type = "response"))
+
+emtrends(algae.model, pairwise ~ Site, var = "FS_t0", data = frames.growth[frames.growth$Group_code == "AL",])
+
+emmip(algae.model,data = frames.growth[frames.growth$Group_code == "AL",], Site ~ FS_t0, cov.reduce = range)
+```
+
+Weak (0.198537) but significant positive lagged relationship between algae and free space (p = 0.0179). Post-hoc analysis basically shows the same results as the effects plot, just need to figure out how to report it exactly (not trivial for an additive model).
+
+### 2.4 CCA
+
+```{r, fig.width = 12, fig.height = 5}
+
+# first use ML to pick the relevant fixed effects
+
+coralal.null <- nlme::lme(Cover.t1 ~ 1,
+                        random = ~ 1 | QuadratSite, 
+                        data = frames.growth[frames.growth$Group_code == "CA",],
+                        na.action = "na.omit",
+                        method = "ML",
+                        correlation = corCAR1(value = 0.2, form = ~ Year | QuadratSite))
+
+coralal.fs <- update(coralal.null, . ~ . + FS_t0)
+coralal.site <- update(coralal.null, . ~ . + Site)
+coralal.add <- update(coralal.fs, . ~ . + Site)
+coralal.all <- update(coralal.add, . ~ . + FS_t0 * Site)
+
+# backwards selection
+
+anova(coralal.all, coralal.add) # interaction does not matter, p = 0.1228
+anova(coralal.add, coralal.fs) # site matters, p = <.0001
+anova(coralal.add, coralal.site) # free space alone does not matter, p = 0.0784
+
+# fit variance structure
+
+coralal.site.var <- update(coralal.site, weights = varIdent(form = ~ 1 | QuadratSite))
+
+# re-fit with REML
+
+coralal.model <- update(coralal.site.var, method = "REML", control = lmeControl(opt='optim'))
+
+summary(coralal.model) 
+
+jpeg("//Staff/Home/SCIFAC/rovellal/DocumentsRedir/Projects/Defense/residuals/Ch4_LMM_CA_FS.jpeg", width = 11, height = 3.5, units = "in", res = 300) 
+par(mfrow = c(1, 3))
+plot(resid(coralal.model, type = "normalized")) # overdispersion, heteroskedasticity and extreme outliers
+hist(residuals(coralal.model, type = "normalized"))
+qqnorm(residuals(coralal.model, type = "normalized"))
+qqline(residuals(coralal.model, type = "normalized")) 
+dev.off()
+
+# post-hoc pairwise analysis: bonferroni correction
+
+em_CA_FS <- emmeans(coralal.model, pairwise ~ Site)
+
+summary(em_CA_FS, adjust = "bonferroni")
+
+```
+
+### 2.5 Other
+
+```{r, fig.width = 12, fig.height = 5}
+
+# first use ML to pick the relevant fixed effects
+
+other.null <- nlme::lme(Cover.t1 ~ 1,
+                        random = ~ 1 | QuadratSite, 
+                        data = frames.growth[frames.growth$Group_code == "OT",],
+                        na.action = "na.omit",
+                        method = "ML",
+                        correlation = corCAR1(value = 0.2, form = ~ Year | QuadratSite))
+
+other.fs <- update(other.null, . ~ . + FS_t0)
+other.site <- update(other.null, . ~ . + Site)
+other.add <- update(other.fs, . ~ . + Site)
+other.all <- update(other.add, . ~ . + FS_t0 * Site)
+
+# backwards selection
+
+anova(other.all, other.add) # interaction does not matter, p = 0.2293
+anova(other.add, other.fs) # site matters, p = 0.0146
+anova(other.add, other.site) # free space alone does not matter, p = 0.4417
+
+# fit variance structure
+
+other.site.var <- update(other.site, weights = varIdent(form = ~ 1 | QuadratSite))
+
+# re-fit with REML
+
+other.model <- update(other.site.var, method = "REML")
+
+summary(other.model) 
+
+jpeg("//Staff/Home/SCIFAC/rovellal/DocumentsRedir/Projects/Defense/residuals/Ch4_LMM_OT_FS.jpeg", width = 11, height = 3.5, units = "in", res = 300) 
+par(mfrow = c(1, 3))
+plot(resid(other.model, type = "normalized")) # overdispersion, heteroskedasticity and extreme outliers
+hist(residuals(other.model, type = "normalized"))
+qqnorm(residuals(other.model, type = "normalized"))
+qqline(residuals(other.model, type = "normalized")) 
+dev.off()
+
+# post-hoc pairwise analysis: bonferroni correction
+
+em_OT_FS <- emmeans(other.model, pairwise ~ Site)
+
+summary(em_OT_FS, adjust = "bonferroni")
+
+```
+
+Model that includes site is best (p = 0.0146). Data are overdispersed. Sites 2 abnd 3 differ (0.0028), not the others. This is ifferent from model above with site and time , likely this is because the dataset is different, we got rid of an outlier and now the dynamics for this groupos are different. 
+
+All in all, HC, SP and OT only show spatial variation (as already shown above), with no evidence for free space the year before being a good predictor of cover of these group the following year. Algae however, do show a (weak) lagged positive relationship with free space.
+
+## 2.3 Effect of free space on algal cover
+
+```{r, fig.width = 7.5, fig.height = 2.8}
+
+ef.space.AL <- data.frame(Effect(c("FS_t0", "Site"), algae.model,  xlevel = 10))
+
+p <- ggplot()+
+  geom_line(data = ef.space.AL, aes(x = FS_t0, y=fit, group=Site))+
+  geom_line(data = ef.space.AL, aes(x = FS_t0, y = lower), linetype = "dashed", color = "darkgrey")+
+  geom_line(data = ef.space.AL, aes(x = FS_t0, y = upper), linetype = "dashed", color = "darkgrey")+
+  geom_point(data = frames.growth[frames.growth$Group_code == "AL",],
+             aes(x = FS_t0, y = Cover.t1, shape = Quadrat), alpha = .8)+
+  scale_color_brewer(palette = "Set1")+
+  scale_x_continuous(breaks = seq(0, 30, 5))+
+  theme_bw()+
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank())+
+  facet_grid(~ Site)+
+  theme(strip.text.x = element_blank(), strip.background = element_blank())
+
+p
+
+# ggsave("//Staff/Home/SCIFAC/rovellal/DocumentsRedir/Projects/Chapter 2/Statistics/trunk_FS_as_FS/pics/AL_FS_model.pdf", p, width = 7.5, height = 3)
+
+```
+
+Fit is pretty poor, very weak effect / relationship. 
+
+***
+
+# Relationship between sponge cover and sponge abundance (Set 3)
+
+Sponge cover does not show long-term temporal changes, nor a pattern resembling the one observed for total sponge abundance / density in the previous chapter. Why? Are sponge counts and cover correlated at all? 
+
+```{r fig.height = 5, fig.width = 8}
+
+# introduce sponge counts data and test for correlation with sponge cover
+
+sponge.counts <- read.csv(file = "//Staff/Home/SCIFAC/rovellal/DocumentsRedir/Projects/Chapter 2/Statistics/trunk_FS_as_FS/buoy3_model_data_2017.csv", 
+                          stringsAsFactors = FALSE, header = TRUE)
+
+sponge.counts$Year <- sponge.counts$Year+2000
+
+# subset to matching years only
+
+my.years <- levels(factor(all.frames$Year))
+
+sponge.counts.match <- sponge.counts[sponge.counts$Year %in% my.years,]
+
+# subset %cover dataset to sponges only
+
+sponge.cover.match <- all.frames[all.frames$Group_code == "SP",] 
+# sponge.cover.match <- sponge.cover[sponge.cover$Year != 2017,]
+
+# drop 2015_S3_Q3 from the counts dataset
+
+sponge.counts.match.all <- sponge.counts.match[!(sponge.counts.match$Year == 2015 & 
+                                                   sponge.counts.match$QuadratSite == "C3"),]
+
+# write new dataframe with cover and counts
+
+sponges <- cbind(sponge.cover.match, sponge.counts.match.all$Total)
+
+names(sponges) <- c(names(sponges)[-length(names(sponges))], "Counts")
+
+sponges$QuadratSite <- paste(sponges$Quadrat, sponges$Site, sep = "")
+
+```
+
+```{r}
+
+cov.null <- nlme::lme(Cover ~ 1, 
+                      random = ~ 1 | QuadratSite,
+                      correlation = corCAR1(value = 0.2, form = ~ Year | QuadratSite),
+                      data = sponges, 
+                      method = "ML", 
+                      na.action = na.omit)
+
+cov.count <- update(cov.null, . ~ . + Counts)
+cov.site <- update(cov.null, . ~ . + Site)
+cov.add <- update(cov.count, . ~ . + Site)
+cov.all <- update(cov.add, . ~ . + Counts * Site)
+
+anova(cov.all, cov.add) # interaction does not count, p = 0.8918
+anova(cov.add, cov.count) # site counts, p = 0.001
+anova(cov.add, cov.site) # counts do not count, p = 0.0994
+
+# fit variance
+
+cov.site.var <- update(cov.site, weights = varIdent(form = ~ 1 | QuadratSite), control = lmeControl(opt = 'optim'))
+
+# re-fit with REML
+
+cov.model <- update(cov.site.var, method = "REML")
+
+summary(cov.model) 
+
+par(mfrow = c(1, 3))
+plot(resid(cov.model, type = "normalized")) 
+hist(residuals(cov.model, type = "normalized"))
+qqnorm(residuals(cov.model, type = "normalized"))
+qqline(residuals(cov.model, type = "normalized")) # actually pretty decent fit
+
+# post-hoc pairwise analysis: bonferroni correction
+
+em_sponge_cover <- emmeans(cov.model, pairwise ~ Site)
+
+summary(em_sponge_cover, adjust = "bonferroni")
+
+```
+
+Sponge % cover and number of individuals per quadrat do not show any relationship. This is not surprising given the type of sponges inhabiting these quadrats. Sponges here are >90% small encrusting individuals, which contribute very little the total % cover of sponges on the reef. Large patches of encrusting individuals are the main contributors to % cover, whereas they contribute very marginally to counts. This highlights that, depending on the focus of the investigation, different measures of sponge abundance are recommended. With biomass being perhaps the ideal indicator of sponge abundance but also the most unpractical (e.g. time-demanding, sometime impossible to measure because of legal restrictions on removal of animals, and in all cases difficult to estimate), if one is after detailed assemblage studies and biodiversity assessments, then counting patches is preferrable. If one is after community study of the main dominant benthic organisms, then cover is acceptable. In all cases, these two are not interchangeable. 
+
+***
+
+Note: models above show that site 3 is different from sites 1 and 2 in that: coral cover is lower; sponge cover is higher; algal cover is higher; CCA is higher. Considering the main competitors, site 3 is the only site where there is potential for states that are not coral-dominated.
